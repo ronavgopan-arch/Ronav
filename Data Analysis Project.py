@@ -1,14 +1,13 @@
 """
 =====================================================================
-FULL FAST-FASHION MATERIAL COMPOSITION PROJECT — COMBINED SCRIPT
-(Zara removed. Duplicate H&M file removed — only H&M US is used.)
+FULL FAST-FASHION MATERIAL COMPOSITION PROJECT 
 =====================================================================
 Sections:
   0. Setup / config
   1. Clean ASOS
   2. Clean Shein
   3. Clean harmonized H&M + Uniqlo (xlsx, GB/Aus regions)
-  4. Clean H&M US (handm (2).csv, real prices)
+  4. Clean H&M (handm.csv, real prices, region = US)
   5. Material composition tables/graphs by store
   6. One-way ANOVA — materials per product, by store
   7. One-way ANOVA — % composition (polyester / recycled polyester / cotton), by store
@@ -40,7 +39,7 @@ except NameError:
 RAW_ASOS_PATH = 'products_asos.csv'
 RAW_SHEIN_PATH = 'shein_sample.csv'
 RAW_HARMONIZED_PATH = '6_JSONL_component_normalized_public_clean.csv.xlsx'
-RAW_HM_US_PATH = 'handm (2).csv'
+RAW_HM_PATH = 'handm.csv'
 
 print("Working directory:", os.getcwd())
 print("Files here:", os.listdir())
@@ -76,10 +75,11 @@ def extract_composition_materials(text):
 
 
 def extract_materials_pct_first(text):
+    """Parses ASOS/Shein-style text: percentage BEFORE the material name."""
     if not text:
         return []
     materials = []
-    for pct, name in re.findall(r'(\d+(?:\.\d+)?)%\s*([A-Za-z][A-Za-z\s\-]*?)(?=[,\.]|$)', text):
+    for _pct, name in re.findall(r'(\d+(?:\.\d+)?)%\s*([A-Za-z][A-Za-z\s\-]*?)(?=[,\.]|$)', text):
         name_clean = re.sub(r'\s+', ' ', name.strip())
         if name_clean:
             materials.append(name_clean)
@@ -119,6 +119,7 @@ def classify_row(materials_list, recycled_bases):
 
 
 def extract_pct(text, include_terms, exclude_terms=None):
+    """Highest % mention of a material matching ALL include_terms and NONE of exclude_terms."""
     if pd.isna(text):
         return np.nan
     matches = re.findall(r'(\d+(?:\.\d+)?)\s*%\s*([A-Za-z][A-Za-z\s\-]*?)(?=[,\./]|$)', str(text))
@@ -155,7 +156,73 @@ def parse_description(text):
     return result
 
 
+def parse_components(json_text):
+    """Parses the 'components_structured' JSON column from the harmonized dataset."""
+    try:
+        components = json.loads(json_text)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if isinstance(components, dict):
+        components = [components]
+    materials = []
+    for comp in components:
+        if not isinstance(comp, dict):
+            continue
+        for mat in comp.get('materials', []):
+            materials.append((mat.get('material'), mat.get('pct'), mat.get('recycled_pct')))
+    return materials
+
+
+def classify_materials_struct(materials_parsed):
+    classified = []
+    for material, _pct, recycled_pct in materials_parsed:
+        if not material:
+            continue
+        mat_lower = material.strip().lower()
+        is_recycled = recycled_pct is not None and recycled_pct > 0
+        if mat_lower == 'polyester':
+            label = 'Recycled Polyester' if is_recycled else 'Polyester (Virgin)'
+        elif mat_lower in ('polyamide', 'nylon'):
+            label = 'Recycled Polyamide/Nylon' if is_recycled else 'Polyamide/Nylon (Virgin)'
+        elif mat_lower == 'cotton':
+            label = 'Recycled Cotton' if is_recycled else 'Cotton (Virgin)'
+        elif mat_lower == 'wool':
+            label = 'Recycled Wool' if is_recycled else 'Wool (Virgin)'
+        else:
+            label = material.strip().title()
+            if is_recycled:
+                label = f'Recycled {label}'
+        classified.append(label)
+    return classified
+
+
+def total_polyester_pct(materials_parsed):
+    """Sum of ALL polyester % (recycled + virgin combined) per product."""
+    total = sum(pct for mat, pct, _rpct in materials_parsed
+                if mat and mat.strip().lower() == 'polyester' and pct is not None)
+    return total if total > 0 else None
+
+
+def recycled_polyester_pct_struct(materials_parsed):
+    total, recycled = 0.0, 0.0
+    for material, pct, recycled_pct in materials_parsed:
+        if material and material.strip().lower() == 'polyester' and pct is not None:
+            total += pct
+            if recycled_pct is not None:
+                recycled += pct * (recycled_pct / 100.0)
+    return round(100 * recycled / total, 1) if total else None
+
+
+def recycled_polyester_pct_hm(text):
+    """For H&M's raw COMPOSITION-style text: sums explicit 'X% Recycled polyester' mentions."""
+    if pd.isna(text):
+        return np.nan
+    matches = re.findall(r'(\d+(?:\.\d+)?)%\s*Recycled\s+polyester\b', text, re.IGNORECASE)
+    return sum(float(m) for m in matches) if matches else np.nan
+
+
 def save_and_report(df, base_name):
+    """Standard save + material count report used across all stores."""
     df.to_csv(f'{base_name}_clean.csv', index=False)
     organized = df.sort_values(['primaryMaterial', 'productName']).reset_index(drop=True) \
         if 'primaryMaterial' in df.columns and 'productName' in df.columns else df
@@ -177,12 +244,46 @@ def save_and_report(df, base_name):
     print(f"\nSaved: {base_name}_clean.csv, {base_name}_by_material.csv, {base_name}_material_counts.csv")
 
 
+def get_top_materials(store_df, top_n=10):
+    counter = Counter()
+    for s in store_df['allMaterials'].dropna():
+        s = str(s).strip()
+        if not s:
+            continue
+        for m in s.split(';'):
+            m = m.strip()
+            if m:
+                counter[m] += 1
+    total = len(store_df)
+    unparsed = int((store_df['primaryMaterial'] == 'Unknown').sum()) if 'primaryMaterial' in store_df.columns else 0
+    top = counter.most_common(top_n)
+    table = pd.DataFrame([{'material': m, 'productCount': c, 'pctOfProducts': round(100 * c / total, 1)} for m, c in top])
+    return total, unparsed, table
+
+
+def plot_store_materials(store_name, total, unparsed, table):
+    if table.empty:
+        return
+    colors = ['#1D9E75' if m.lower().startswith('recycled') else '#888780' for m in table['material']]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.barh(table['material'][::-1], table['pctOfProducts'][::-1], color=colors[::-1])
+    ax.set_xlabel('% of products containing this material')
+    ax.set_title(f'{store_name} — top materials\n({total:,} products, {unparsed:,} unparsed)')
+    ax.set_xlim(0, 100)
+    for i, v in enumerate(table['pctOfProducts'][::-1]):
+        ax.text(v + 1, i, f'{v}%', va='center', fontsize=9)
+    plt.tight_layout()
+    safe = store_name.replace('&', 'and').replace(' ', '_')
+    plt.savefig(f'{safe}_material_composition.png', dpi=150)
+    print(f"Saved: {safe}_material_composition.png")
+
+
 # =====================================================================
 # 1. CLEAN ASOS
 # =====================================================================
-print("\n" + "="*90)
+print("\n" + "=" * 90)
 print("SECTION 1: CLEAN ASOS")
-print("="*90)
+print("=" * 90)
 
 if os.path.isfile(RAW_ASOS_PATH):
     asos_raw = pd.read_csv(RAW_ASOS_PATH)
@@ -196,6 +297,7 @@ if os.path.isfile(RAW_ASOS_PATH):
             return 'Unknown'
         m = re.search(r'asos\.com/([^/]+)/', url)
         return m.group(1).replace('-', ' ').title() if m else 'Unknown'
+
     asos_raw['brandName'] = asos_raw['url'].apply(extract_asos_brand)
 
     asos_raw['description_parsed'] = asos_raw['description'].apply(parse_description)
@@ -236,9 +338,9 @@ else:
 # =====================================================================
 # 2. CLEAN SHEIN
 # =====================================================================
-print("\n" + "="*90)
+print("\n" + "=" * 90)
 print("SECTION 2: CLEAN SHEIN")
-print("="*90)
+print("=" * 90)
 
 if os.path.isfile(RAW_SHEIN_PATH):
     shein_raw = pd.read_csv(RAW_SHEIN_PATH, sep=';', encoding='latin1', on_bad_lines='skip', engine='python')
@@ -290,9 +392,9 @@ else:
 # =====================================================================
 # 3. CLEAN HARMONIZED H&M + UNIQLO (GB / Aus regions)
 # =====================================================================
-print("\n" + "="*90)
+print("\n" + "=" * 90)
 print("SECTION 3: CLEAN HARMONIZED H&M + UNIQLO")
-print("="*90)
+print("=" * 90)
 
 if os.path.isfile(RAW_HARMONIZED_PATH):
     harm_raw = pd.read_excel(RAW_HARMONIZED_PATH)
@@ -304,57 +406,6 @@ if os.path.isfile(RAW_HARMONIZED_PATH):
     before = len(harm_raw)
     harm_clean = harm_raw[~is_footwear].copy().reset_index(drop=True)
     print(f"Rows before footwear removal: {before}  Rows after: {len(harm_clean)}")
-
-    def parse_components(json_text):
-        try:
-            components = json.loads(json_text)
-        except (json.JSONDecodeError, TypeError):
-            return []
-        if isinstance(components, dict):
-            components = [components]
-        materials = []
-        for comp in components:
-            if not isinstance(comp, dict):
-                continue
-            for mat in comp.get('materials', []):
-                materials.append((mat.get('material'), mat.get('pct'), mat.get('recycled_pct')))
-        return materials
-
-    def classify_materials_struct(materials_parsed):
-        classified = []
-        for material, pct, recycled_pct in materials_parsed:
-            if not material:
-                continue
-            mat_lower = material.strip().lower()
-            is_recycled = recycled_pct is not None and recycled_pct > 0
-            if mat_lower == 'polyester':
-                label = 'Recycled Polyester' if is_recycled else 'Polyester (Virgin)'
-            elif mat_lower in ('polyamide', 'nylon'):
-                label = 'Recycled Polyamide/Nylon' if is_recycled else 'Polyamide/Nylon (Virgin)'
-            elif mat_lower == 'cotton':
-                label = 'Recycled Cotton' if is_recycled else 'Cotton (Virgin)'
-            elif mat_lower == 'wool':
-                label = 'Recycled Wool' if is_recycled else 'Wool (Virgin)'
-            else:
-                label = material.strip().title()
-                if is_recycled:
-                    label = f'Recycled {label}'
-            classified.append(label)
-        return classified
-
-    def total_polyester_pct(materials_parsed):
-        total = sum(pct for mat, pct, rpct in materials_parsed
-                    if mat and mat.strip().lower() == 'polyester' and pct is not None)
-        return total if total > 0 else None
-
-    def recycled_polyester_pct_struct(materials_parsed):
-        total, recycled = 0.0, 0.0
-        for material, pct, recycled_pct in materials_parsed:
-            if material and material.strip().lower() == 'polyester' and pct is not None:
-                total += pct
-                if recycled_pct is not None:
-                    recycled += pct * (recycled_pct / 100.0)
-        return round(100 * recycled / total, 1) if total else None
 
     harm_clean['materials_parsed'] = harm_clean['components_structured'].apply(parse_components)
     harm_clean['materials_list_classified'] = harm_clean['materials_parsed'].apply(classify_materials_struct)
@@ -390,99 +441,60 @@ else:
 
 
 # =====================================================================
-# 4. CLEAN H&M US (handm (2).csv, real prices, tagged region = US)
+# 4. CLEAN H&M (handm.csv, real prices, tagged region = US)
 # =====================================================================
-print("\n" + "="*90)
-print("SECTION 4: CLEAN H&M US")
-print("="*90)
+print("\n" + "=" * 90)
+print("SECTION 4: CLEAN H&M")
+print("=" * 90)
 
-if os.path.isfile(RAW_HM_US_PATH):
-    hmus_raw = pd.read_csv(RAW_HM_US_PATH)
-    if 'Unnamed: 0' in hmus_raw.columns:
-        hmus_raw.drop('Unnamed: 0', axis=1, inplace=True)
+if os.path.isfile(RAW_HM_PATH):
+    hm_raw = pd.read_csv(RAW_HM_PATH)
+    if 'Unnamed: 0' in hm_raw.columns:
+        hm_raw.drop('Unnamed: 0', axis=1, inplace=True)
 
-    shoe_cats = [c for c in hmus_raw['mainCatCode'].dropna().unique() if 'shoe' in c.lower()]
+    shoe_cats = [c for c in hm_raw['mainCatCode'].dropna().unique() if 'shoe' in c.lower()]
     shoe_cats.append('ladies_nightwear_slippers')
-    before = len(hmus_raw)
-    hmus_clean = hmus_raw[~hmus_raw['mainCatCode'].isin(shoe_cats)].copy().reset_index(drop=True)
-    print(f"Rows before: {before}  Rows after footwear removal: {len(hmus_clean)}")
+    before = len(hm_raw)
+    hm_clean = hm_raw[~hm_raw['mainCatCode'].isin(shoe_cats)].copy().reset_index(drop=True)
+    print(f"Rows before: {before}  Rows after footwear removal: {len(hm_clean)}")
 
-    hmus_clean['materials_list'] = hmus_clean['materials'].apply(extract_composition_materials)
-    hmus_clean['recycled_bases'] = hmus_clean['materials'].apply(extract_recycled_bases)
-    hmus_clean['materials_list_classified'] = hmus_clean.apply(
+    hm_clean['materials_list'] = hm_clean['materials'].apply(extract_composition_materials)
+    hm_clean['recycled_bases'] = hm_clean['materials'].apply(extract_recycled_bases)
+    hm_clean['materials_list_classified'] = hm_clean.apply(
         lambda row: classify_row(row['materials_list'], row['recycled_bases']), axis=1)
 
-    hmus_clean['primaryMaterial'] = hmus_clean['materials_list_classified'].apply(lambda lst: lst[0] if lst else 'Unknown')
-    hmus_clean['allMaterials'] = hmus_clean['materials_list_classified'].apply(lambda lst: '; '.join(sorted(set(lst))) if lst else '')
-    hmus_clean['containsRecycledPolyester'] = hmus_clean['materials_list_classified'].apply(lambda lst: 'Recycled Polyester' in lst)
-    hmus_clean['containsVirginPolyester'] = hmus_clean['materials_list_classified'].apply(lambda lst: 'Polyester (Virgin)' in lst)
-
-    def recycled_polyester_pct_hm(text):
-        if pd.isna(text):
-            return np.nan
-        matches = re.findall(r'(\d+(?:\.\d+)?)%\s*Recycled\s+polyester\b', text, re.IGNORECASE)
-        return sum(float(m) for m in matches) if matches else np.nan
-
-    hmus_clean['recycledPolyesterPct'] = hmus_clean['materials'].apply(recycled_polyester_pct_hm)
-    hmus_clean['region'] = 'US'
-    hmus_clean['brandName'] = 'hm'
+    hm_clean['primaryMaterial'] = hm_clean['materials_list_classified'].apply(lambda lst: lst[0] if lst else 'Unknown')
+    hm_clean['allMaterials'] = hm_clean['materials_list_classified'].apply(lambda lst: '; '.join(sorted(set(lst))) if lst else '')
+    hm_clean['containsRecycledPolyester'] = hm_clean['materials_list_classified'].apply(lambda lst: 'Recycled Polyester' in lst)
+    hm_clean['containsVirginPolyester'] = hm_clean['materials_list_classified'].apply(lambda lst: 'Polyester (Virgin)' in lst)
+    hm_clean['recycledPolyesterPct'] = hm_clean['materials'].apply(recycled_polyester_pct_hm)
+    hm_clean['region'] = 'US'
+    hm_clean['brandName'] = 'hm'
 
     output_cols = ['productId', 'productName', 'brandName', 'region', 'url', 'price', 'stockState',
                    'colorName', 'mainCatCode', 'details', 'materials', 'primaryMaterial', 'allMaterials',
                    'containsRecycledPolyester', 'containsVirginPolyester', 'recycledPolyesterPct']
-    hmus_final = hmus_clean[output_cols].copy()
+    hm_final = hm_clean[output_cols].copy()
 
-    save_and_report(hmus_final, 'hm_us')
-    print(f"Products with price: {hmus_final['price'].notna().sum()}")
+    save_and_report(hm_final, 'hm')
+    print(f"Products with price: {hm_final['price'].notna().sum()}")
 else:
-    print(f"NOT FOUND: '{RAW_HM_US_PATH}' — skipping Section 4.")
+    print(f"NOT FOUND: '{RAW_HM_PATH}' — skipping Section 4.")
 
 
 # =====================================================================
 # 5. MATERIAL COMPOSITION BY STORE — TABLES + GRAPHS
 # =====================================================================
-print("\n" + "="*90)
+print("\n" + "=" * 90)
 print("SECTION 5: MATERIAL COMPOSITION BY STORE (tables + graphs)")
-print("="*90)
+print("=" * 90)
 
 STORE_FILES = {
-    'H&M US': 'hm_us_clean.csv',
+    'H&M': 'hm_clean.csv',
     'Uniqlo': None,  # pulled from hm_uniqlo_clean.csv below
     'ASOS': 'asos_clean.csv',
     'Shein': 'shein_clean.csv',
 }
-
-def get_top_materials(store_df, top_n=10):
-    counter = Counter()
-    for s in store_df['allMaterials'].dropna():
-        s = str(s).strip()
-        if not s:
-            continue
-        for m in s.split(';'):
-            m = m.strip()
-            if m:
-                counter[m] += 1
-    total = len(store_df)
-    unparsed = int((store_df['primaryMaterial'] == 'Unknown').sum()) if 'primaryMaterial' in store_df.columns else 0
-    top = counter.most_common(top_n)
-    table = pd.DataFrame([{'material': m, 'productCount': c, 'pctOfProducts': round(100*c/total, 1)} for m, c in top])
-    return total, unparsed, table
-
-def plot_store_materials(store_name, total, unparsed, table):
-    if table.empty:
-        return
-    colors = ['#1D9E75' if m.lower().startswith('recycled') else '#888780' for m in table['material']]
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.barh(table['material'][::-1], table['pctOfProducts'][::-1], color=colors[::-1])
-    ax.set_xlabel('% of products containing this material')
-    ax.set_title(f'{store_name} — top materials\n({total:,} products, {unparsed:,} unparsed)')
-    ax.set_xlim(0, 100)
-    for i, v in enumerate(table['pctOfProducts'][::-1]):
-        ax.text(v + 1, i, f'{v}%', va='center', fontsize=9)
-    plt.tight_layout()
-    safe = store_name.replace('&', 'and').replace(' ', '_')
-    plt.savefig(f'{safe}_material_composition.png', dpi=150)
-    print(f"Saved: {safe}_material_composition.png")
 
 for store_name, path in STORE_FILES.items():
     if store_name == 'Uniqlo':
@@ -502,18 +514,20 @@ for store_name, path in STORE_FILES.items():
     print(f"\n=== {store_name} === Total: {total}  Unparsed: {unparsed}")
     print(table.to_string(index=False))
     plot_store_materials(store_name, total, unparsed, table)
-    table.to_csv(f'{store_name.replace("&","and").replace(" ","_")}_top_materials.csv', index=False)
+    table.to_csv(f'{store_name.replace("&", "and").replace(" ", "_")}_top_materials.csv', index=False)
 
 
 # =====================================================================
 # 6. ONE-WAY ANOVA — materials per product (complexity), by store
 # =====================================================================
-print("\n" + "="*90)
+print("\n" + "=" * 90)
 print("SECTION 6: ANOVA — materials per product, by store")
-print("="*90)
+print("=" * 90)
+
+ANOVA_STORE_FILES = {'H&M': 'hm_clean.csv', 'ASOS': 'asos_clean.csv', 'Shein': 'shein_clean.csv'}
 
 anova_frames = []
-for store_name, path in {'H&M US': 'hm_us_clean.csv', 'ASOS': 'asos_clean.csv', 'Shein': 'shein_clean.csv'}.items():
+for store_name, path in ANOVA_STORE_FILES.items():
     if os.path.isfile(path):
         d = pd.read_csv(path)
         d['materialCount'] = d['allMaterials'].fillna('').apply(lambda s: len([m for m in str(s).split(';') if m.strip()]))
@@ -529,7 +543,7 @@ if anova_frames:
     summary = anova_valid.groupby('store')['materialCount'].agg(['count', 'mean', 'std', 'min', 'max'])
     print(summary.round(2).to_string())
 
-    groups = [g['materialCount'].values for name, g in anova_valid.groupby('store')]
+    groups = [g['materialCount'].values for _store_name, g in anova_valid.groupby('store')]
     if len(groups) >= 2:
         f_stat, p_value = stats.f_oneway(*groups)
         print(f"\nF-statistic: {f_stat:.4f}, p-value: {p_value:.6f}",
@@ -560,14 +574,14 @@ else:
 # =====================================================================
 # 7. ONE-WAY ANOVA — % composition (polyester / recycled polyester / cotton), by store
 # =====================================================================
-print("\n" + "="*90)
+print("\n" + "=" * 90)
 print("SECTION 7: ANOVA — material % composition, by store")
-print("="*90)
+print("=" * 90)
 
 TARGETS = {'polyester': 'polyester', 'recycled polyester': 'recycled_polyester', 'cotton': 'cotton'}
 
 pct_frames = []
-for store_name, path in {'H&M US': 'hm_us_clean.csv', 'ASOS': 'asos_clean.csv', 'Shein': 'shein_clean.csv'}.items():
+for store_name, path in ANOVA_STORE_FILES.items():
     if os.path.isfile(path):
         d = pd.read_csv(path)
         d['store'] = store_name
@@ -580,7 +594,9 @@ if pct_frames:
 
     for target_str, safe_name in TARGETS.items():
         print(f"\n--- {target_str} ---")
-        pct_combined[f'{safe_name}_pct'] = pct_combined['materials'].apply(lambda t: extract_pct(t, [target_str]))
+        pct_combined[f'{safe_name}_pct'] = pct_combined['materials'].apply(
+            lambda t, ts=target_str: extract_pct(t, [ts])
+        )
         valid = pct_combined.dropna(subset=[f'{safe_name}_pct'])
         print(f"Products containing '{target_str}': {len(valid)}")
         if valid.empty:
@@ -589,7 +605,7 @@ if pct_frames:
         summary = valid.groupby('store')[f'{safe_name}_pct'].agg(['count', 'mean', 'std'])
         print(summary.round(2).to_string())
 
-        groups = [g[f'{safe_name}_pct'].values for name, g in valid.groupby('store') if len(g) >= 2]
+        groups = [g[f'{safe_name}_pct'].values for _store_name, g in valid.groupby('store') if len(g) >= 2]
         if len(groups) >= 2:
             f_stat, p_value = stats.f_oneway(*groups)
             print(f"ANOVA: F={f_stat:.4f}, p={p_value:.6f}", "(significant)" if p_value < 0.05 else "(not significant)")
@@ -612,12 +628,12 @@ else:
 # =====================================================================
 # 8. MATERIAL COMPOSITION vs PRICE
 # =====================================================================
-print("\n" + "="*90)
+print("\n" + "=" * 90)
 print("SECTION 8: MATERIAL COMPOSITION vs PRICE")
-print("="*90)
+print("=" * 90)
 
 price_frames = []
-for store_name, path in {'H&M US': 'hm_us_clean.csv', 'ASOS': 'asos_clean.csv', 'Shein': 'shein_clean.csv'}.items():
+for store_name, path in ANOVA_STORE_FILES.items():
     if os.path.isfile(path):
         d = pd.read_csv(path)
         d['store'] = store_name
@@ -630,7 +646,9 @@ if price_frames:
     price_combined = pd.concat(price_frames, ignore_index=True)
 
     for target_str, safe_name in TARGETS.items():
-        price_combined[f'{safe_name}_pct'] = price_combined['materials'].apply(lambda t: extract_pct(t, [target_str]))
+        price_combined[f'{safe_name}_pct'] = price_combined['materials'].apply(
+            lambda t, ts=target_str: extract_pct(t, [ts])
+        )
         sub = price_combined.dropna(subset=[f'{safe_name}_pct', 'price'])
         print(f"\n--- {target_str} % vs price --- (n={len(sub)})")
         if len(sub) < 3:
@@ -659,15 +677,15 @@ else:
 # =====================================================================
 # 9. REGION BREAKDOWN PER STORE (H&M: US/GB/Aus, Uniqlo: GB/Aus, ASOS: GB, Shein: India)
 # =====================================================================
-print("\n" + "="*90)
+print("\n" + "=" * 90)
 print("SECTION 9: REGION BREAKDOWN PER STORE")
-print("="*90)
+print("=" * 90)
 
 # ---- H&M ----
 print("\n--- H&M regions ---")
 hm_region_frames = []
-if os.path.isfile('hm_us_clean.csv'):
-    us = pd.read_csv('hm_us_clean.csv')
+if os.path.isfile('hm_clean.csv'):
+    us = pd.read_csv('hm_clean.csv')
     us['region'] = 'US'
     us['price'] = pd.to_numeric(us['price'], errors='coerce')
     hm_region_frames.append(us[['region', 'materials', 'price']])
@@ -675,17 +693,17 @@ if os.path.isfile('hm_uniqlo_clean.csv'):
     raw = pd.read_csv('hm_uniqlo_clean.csv')
     hm_only = raw[raw['brandName'] == 'hm'].copy()
     hm_only['price'] = np.nan
-    # Use polyesterPctTotal directly (already parsed from structured JSON) instead of regex on 'materials'
-    hm_only['materials'] = hm_only['materials']  # raw text kept for cotton/recycled regex fallback
     hm_region_frames.append(hm_only[['region', 'materials', 'price']])
 
 if hm_region_frames:
     hm_region_df = pd.concat(hm_region_frames, ignore_index=True)
     print(hm_region_df['region'].value_counts())
     for target_str, safe_name in TARGETS.items():
-        hm_region_df[f'{safe_name}_pct'] = hm_region_df['materials'].apply(lambda t: extract_pct(t, [target_str]))
+        hm_region_df[f'{safe_name}_pct'] = hm_region_df['materials'].apply(
+            lambda t, ts=target_str: extract_pct(t, [ts])
+        )
         for region in ['US', 'GB', 'Aus']:
-            sub = hm_region_df[(hm_region_df['region'] == region)].dropna(subset=[f'{safe_name}_pct'])
+            sub = hm_region_df[hm_region_df['region'] == region].dropna(subset=[f'{safe_name}_pct'])
             if sub.empty:
                 continue
             print(f"H&M {region} — {target_str}: n={len(sub)}, mean={sub[f'{safe_name}_pct'].mean():.2f}%")
@@ -699,7 +717,9 @@ if os.path.isfile('hm_uniqlo_clean.csv'):
     uq_df = raw[raw['brandName'] == 'uniqlo'].copy()
     print(uq_df['region'].value_counts())
     for target_str, safe_name in TARGETS.items():
-        uq_df[f'{safe_name}_pct'] = uq_df['materials'].apply(lambda t: extract_pct(t, [target_str]))
+        uq_df[f'{safe_name}_pct'] = uq_df['materials'].apply(
+            lambda t, ts=target_str: extract_pct(t, [ts])
+        )
         for region in ['GB', 'Aus']:
             sub = uq_df[uq_df['region'] == region].dropna(subset=[f'{safe_name}_pct'])
             if sub.empty:
@@ -714,7 +734,9 @@ if os.path.isfile('asos_clean.csv'):
     asos_region_df = pd.read_csv('asos_clean.csv')
     asos_region_df['region'] = 'GB'
     for target_str, safe_name in TARGETS.items():
-        asos_region_df[f'{safe_name}_pct'] = asos_region_df['materials'].apply(lambda t: extract_pct(t, [target_str]))
+        asos_region_df[f'{safe_name}_pct'] = asos_region_df['materials'].apply(
+            lambda t, ts=target_str: extract_pct(t, [ts])
+        )
         sub = asos_region_df.dropna(subset=[f'{safe_name}_pct'])
         if not sub.empty:
             print(f"ASOS GB — {target_str}: n={len(sub)}, mean={sub[f'{safe_name}_pct'].mean():.2f}%")
@@ -727,15 +749,17 @@ if os.path.isfile('shein_clean.csv'):
     shein_region_df = pd.read_csv('shein_clean.csv')
     shein_region_df['region'] = 'India'
     for target_str, safe_name in TARGETS.items():
-        shein_region_df[f'{safe_name}_pct'] = shein_region_df['materials'].apply(lambda t: extract_pct(t, [target_str]))
+        shein_region_df[f'{safe_name}_pct'] = shein_region_df['materials'].apply(
+            lambda t, ts=target_str: extract_pct(t, [ts])
+        )
         sub = shein_region_df.dropna(subset=[f'{safe_name}_pct'])
         if not sub.empty:
             print(f"Shein India — {target_str}: n={len(sub)}, mean={sub[f'{safe_name}_pct'].mean():.2f}%")
 else:
     print("shein_clean.csv not found — skipping Shein region breakdown.")
 
-print("\n\n" + "="*90)
+print("\n\n" + "=" * 90)
 print("ALL SECTIONS COMPLETE. Check the working directory for saved CSVs and PNGs.")
-print("="*90)
+print("=" * 90)
 
 plt.show()
