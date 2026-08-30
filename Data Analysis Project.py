@@ -1,18 +1,22 @@
 """
 =====================================================================
-FULL FAST-FASHION MATERIAL COMPOSITION PROJECT 
+FULL FAST-FASHION MATERIAL COMPOSITION PROJECT — COMBINED SCRIPT
 =====================================================================
 Sections:
   0. Setup / config
-  1. Clean ASOS
-  2. Clean Shein
-  3. Clean harmonized H&M + Uniqlo (xlsx, GB/Aus regions)
-  4. Clean H&M (handm.csv, real prices, region = US)
-  5. Material composition tables/graphs by store
-  6. One-way ANOVA — materials per product, by store
-  7. One-way ANOVA — % composition (polyester / recycled polyester / cotton), by store
-  8. Material composition vs price (correlation + scatter)
-  9. Region breakdown per store (H&M: US/GB/Aus, Uniqlo: GB/Aus, ASOS: GB, Shein: India)
+  1. Effect size (eta-squared) for materials/composition ANOVAs
+  2. Levene's test + Welch's ANOVA (robust to unequal variance)
+  3. Multiple regression: price ~ material % + store
+  4. Two-way ANOVA: store x region on polyester %
+  5. Clean ASOS
+  6. Clean Shein
+  7. Clean harmonized H&M + Uniqlo (xlsx, GB/Aus regions)
+  8. Clean H&M (handm.csv, real prices, region = US)
+  9. Material composition tables/graphs by store
+ 10. One-way ANOVA — materials per product, by store
+ 11. One-way ANOVA — % composition (polyester / recycled polyester / cotton), by store
+ 12. Material composition vs price (correlation + scatter)
+ 13. Region breakdown per store (H&M: US/GB/Aus, Uniqlo: GB/Aus, ASOS: GB, Shein: India)
 =====================================================================
 """
 
@@ -40,6 +44,9 @@ RAW_ASOS_PATH = 'products_asos.csv'
 RAW_SHEIN_PATH = 'shein_sample.csv'
 RAW_HARMONIZED_PATH = '6_JSONL_component_normalized_public_clean.csv.xlsx'
 RAW_HM_PATH = 'handm.csv'
+
+ANOVA_STORE_FILES = {'H&M': 'hm_clean.csv', 'ASOS': 'asos_clean.csv', 'Shein': 'shein_clean.csv'}
+TARGETS = {'polyester': 'polyester', 'recycled polyester': 'recycled_polyester', 'cotton': 'cotton'}
 
 print("Working directory:", os.getcwd())
 print("Files here:", os.listdir())
@@ -278,11 +285,231 @@ def plot_store_materials(store_name, total, unparsed, table):
     print(f"Saved: {safe}_material_composition.png")
 
 
+def eta_squared(groups):
+    """Eta-squared: proportion of total variance explained by group membership.
+    Rule of thumb: 0.01 small, 0.06 medium, 0.14 large."""
+    all_vals = np.concatenate(groups)
+    grand_mean = np.mean(all_vals)
+    ss_between = sum(len(g) * (np.mean(g) - grand_mean) ** 2 for g in groups)
+    ss_total = sum((all_vals - grand_mean) ** 2)
+    return ss_between / ss_total if ss_total > 0 else np.nan
+
+
+def welch_anova(groups):
+    """Welch's ANOVA — robust alternative to one-way ANOVA when variances
+    are unequal across groups (doesn't assume homogeneity of variance)."""
+    k = len(groups)
+    ni = np.array([len(g) for g in groups])
+    mi = np.array([np.mean(g) for g in groups])
+    vi = np.array([np.var(g, ddof=1) for g in groups])
+
+    wi = ni / vi
+    grand_mean = np.sum(wi * mi) / np.sum(wi)
+
+    numerator = np.sum(wi * (mi - grand_mean) ** 2) / (k - 1)
+    denom_term = np.sum((1 - wi / np.sum(wi)) ** 2 / (ni - 1))
+    denominator = 1 + (2 * (k - 2) / (k ** 2 - 1)) * denom_term
+
+    f_stat = numerator / denominator
+    df1 = k - 1
+    df2 = (k ** 2 - 1) / (3 * denom_term)
+    p_value = stats.f.sf(f_stat, df1, df2)
+
+    return f_stat, p_value, df1, df2
+
+
 # =====================================================================
-# 1. CLEAN ASOS
+# 1. EFFECT SIZE (eta-squared) for materials/composition ANOVAs
 # =====================================================================
 print("\n" + "=" * 90)
-print("SECTION 1: CLEAN ASOS")
+print("SECTION 1: EFFECT SIZE (eta-squared) FOR EACH ANOVA")
+print("=" * 90)
+print("Rule of thumb: 0.01 = small, 0.06 = medium, 0.14 = large effect")
+
+followup_frames = []
+for store_name, path in ANOVA_STORE_FILES.items():
+    if os.path.isfile(path):
+        d = pd.read_csv(path)
+        d['store'] = store_name
+        d['price'] = pd.to_numeric(d['price'], errors='coerce')
+        d['materialCount'] = d['allMaterials'].fillna('').apply(lambda s: len([m for m in str(s).split(';') if m.strip()]))
+        followup_frames.append(d[['store', 'materials', 'price', 'materialCount']])
+    else:
+        print(f"NOT FOUND: '{path}' — skipping {store_name}")
+
+if not followup_frames:
+    print("No store files found — cannot run Sections 1-3. Run the cleaning sections below first.")
+else:
+    followup_combined = pd.concat(followup_frames, ignore_index=True)
+    followup_combined['polyester_pct'] = followup_combined['materials'].apply(
+        lambda t: extract_pct(t, ['polyester'], ['recycled']))
+    followup_combined['recycled_polyester_pct'] = followup_combined['materials'].apply(
+        lambda t: extract_pct(t, ['recycled', 'polyester']))
+    followup_combined['cotton_pct'] = followup_combined['materials'].apply(
+        lambda t: extract_pct(t, ['cotton'], ['recycled']))
+
+    MEASURES = {
+        'materialCount': 'Materials per product',
+        'polyester_pct': 'Polyester %',
+        'recycled_polyester_pct': 'Recycled Polyester %',
+        'cotton_pct': 'Cotton %',
+    }
+
+    for col, label in MEASURES.items():
+        sub = followup_combined.dropna(subset=[col])
+        groups = [g[col].values for _store_name, g in sub.groupby('store') if len(g) >= 2]
+        if len(groups) < 2:
+            continue
+        f_stat, p_value = stats.f_oneway(*groups)
+        eta2 = eta_squared(groups)
+        size_label = 'small' if eta2 < 0.06 else ('medium' if eta2 < 0.14 else 'large')
+        print(f"\n{label}:")
+        print(f"  F={f_stat:.2f}, p={p_value:.6f}, eta-squared={eta2:.4f} ({size_label} effect)")
+
+
+    # =================================================================
+    # 2. LEVENE'S TEST + WELCH'S ANOVA
+    # =================================================================
+    print("\n" + "=" * 90)
+    print("SECTION 2: LEVENE'S TEST (equal variance check) + WELCH'S ANOVA")
+    print("=" * 90)
+
+    for col, label in MEASURES.items():
+        sub = followup_combined.dropna(subset=[col])
+        groups = [g[col].values for _store_name, g in sub.groupby('store') if len(g) >= 2]
+        if len(groups) < 2:
+            continue
+
+        levene_stat, levene_p = stats.levene(*groups)
+        print(f"\n{label}:")
+        print(f"  Levene's test: stat={levene_stat:.4f}, p={levene_p:.6f}", end='  ')
+        if levene_p < 0.05:
+            print("-> Variances are UNEQUAL across stores (standard ANOVA assumption violated)")
+        else:
+            print("-> Variances are roughly equal (standard ANOVA assumption OK)")
+
+        f_stat, p_value, df1, df2 = welch_anova(groups)
+        print(f"  Welch's ANOVA (robust to unequal variance): F={f_stat:.2f}, df1={df1}, df2={df2:.1f}, p={p_value:.6f}",
+              "(significant)" if p_value < 0.05 else "(not significant)")
+
+
+    # =================================================================
+    # 3. MULTIPLE REGRESSION: price ~ material % + store
+    # =================================================================
+    print("\n" + "=" * 90)
+    print("SECTION 3: MULTIPLE REGRESSION: price ~ recycled% + polyester% + cotton% + store")
+    print("=" * 90)
+
+    reg_df = followup_combined.dropna(subset=['price']).copy()
+    for col in ['recycled_polyester_pct', 'polyester_pct', 'cotton_pct']:
+        reg_df[col] = reg_df[col].fillna(0)
+
+    try:
+        import statsmodels.formula.api as smf
+
+        reg_model = smf.ols(
+            'price ~ recycled_polyester_pct + polyester_pct + cotton_pct + C(store)',
+            data=reg_df
+        ).fit()
+
+        print(reg_model.summary())
+
+        print("\n--- Plain-English interpretation guide ---")
+        print("Positive coef = higher % of that material is associated with HIGHER price, controlling for store")
+        print("Negative coef = higher % of that material is associated with LOWER price, controlling for store")
+        print("P>|t| < 0.05 means that material's effect on price is statistically significant")
+        print("C(store)[T.X] rows show each store's price difference vs. the baseline store,")
+        print("holding material composition constant.")
+
+    except ImportError:
+        print("statsmodels not installed. Install via Thonny's Tools > Manage packages, then re-run.")
+        print("Falling back to plain correlations (does NOT control for store):")
+        for col in ['recycled_polyester_pct', 'polyester_pct', 'cotton_pct']:
+            r, p = stats.pearsonr(reg_df[col], reg_df['price'])
+            print(f"  {col}: r={r:.4f}, p={p:.6f}")
+
+
+# =====================================================================
+# 4. TWO-WAY ANOVA: store x region on polyester %
+# =====================================================================
+print("\n" + "=" * 90)
+print("SECTION 4: TWO-WAY ANOVA: store x region on polyester %")
+print("=" * 90)
+
+two_way_frames = []
+
+if os.path.isfile('hm_uniqlo_clean.csv'):
+    hu_2way = pd.read_csv('hm_uniqlo_clean.csv')
+    print("\nDiagnostic — polyesterPctTotal parse success by store (hm_uniqlo_clean.csv):")
+    print(hu_2way.groupby('brandName')['polyesterPctTotal'].apply(lambda s: s.notna().sum()))
+    hu_2way = hu_2way.rename(columns={'brandName': 'store'})
+    two_way_frames.append(hu_2way[['store', 'region', 'polyesterPctTotal']].rename(
+        columns={'polyesterPctTotal': 'polyester_pct'}))
+else:
+    print("NOT FOUND: 'hm_uniqlo_clean.csv'")
+
+if os.path.isfile('hm_clean.csv'):
+    hm_2way = pd.read_csv('hm_clean.csv')
+    hm_2way['region'] = 'US'
+    hm_2way['polyester_pct'] = hm_2way['materials'].apply(lambda t: extract_pct(t, ['polyester'], ['recycled']))
+    hm_2way['store'] = 'hm'
+    two_way_frames.append(hm_2way[['store', 'region', 'polyester_pct']])
+else:
+    print("NOT FOUND: 'hm_clean.csv'")
+
+if two_way_frames:
+    two_way_df = pd.concat(two_way_frames, ignore_index=True).dropna(subset=['polyester_pct'])
+    print(f"\nData used: {len(two_way_df)} products")
+    print(two_way_df.groupby(['store', 'region']).size())
+
+    n_stores = two_way_df['store'].nunique()
+    n_regions = two_way_df['region'].nunique()
+
+    if n_stores < 2 or n_regions < 2:
+        print(f"\nCannot run a two-way ANOVA: need at least 2 stores AND 2 regions with data.")
+        print(f"Currently have {n_stores} store(s) and {n_regions} region(s) after dropping unparsed rows.")
+    else:
+        try:
+            import statsmodels.formula.api as smf
+            from statsmodels.stats.anova import anova_lm
+
+            twoway_model = smf.ols('polyester_pct ~ C(store) * C(region)', data=two_way_df).fit()
+            anova_table = anova_lm(twoway_model, typ=2)
+            print("\n--- Two-way ANOVA table ---")
+            print(anova_table)
+
+            print("\n--- Interpretation guide ---")
+            print("C(store): does polyester % differ by store, averaged across regions?")
+            print("C(region): does polyester % differ by region, averaged across stores?")
+            print("C(store):C(region): does the store effect DEPEND on region (interaction)?")
+            print("PR(>F) < 0.05 means that effect is statistically significant.")
+
+            fig, ax = plt.subplots(figsize=(8, 5))
+            for store in two_way_df['store'].unique():
+                sub = two_way_df[two_way_df['store'] == store]
+                means = sub.groupby('region')['polyester_pct'].mean()
+                ax.plot(means.index, means.values, marker='o', label=store)
+            ax.set_xlabel('Region')
+            ax.set_ylabel('Mean Polyester %')
+            ax.set_title('Store x Region interaction: Polyester %')
+            ax.legend()
+            plt.tight_layout()
+            plt.savefig('twoway_anova_interaction_plot.png', dpi=150)
+            print("\nSaved: twoway_anova_interaction_plot.png")
+
+        except ImportError:
+            print("statsmodels not installed. Install via Thonny's Tools > Manage packages, then re-run.")
+        except ValueError as e:
+            print(f"\nANOVA failed: {e}")
+else:
+    print("Not enough region-tagged data available to run the two-way ANOVA.")
+
+
+# =====================================================================
+# 5. CLEAN ASOS
+# =====================================================================
+print("\n" + "=" * 90)
+print("SECTION 5: CLEAN ASOS")
 print("=" * 90)
 
 if os.path.isfile(RAW_ASOS_PATH):
@@ -332,14 +559,14 @@ if os.path.isfile(RAW_ASOS_PATH):
 
     save_and_report(asos_final, 'asos')
 else:
-    print(f"NOT FOUND: '{RAW_ASOS_PATH}' — skipping Section 1.")
+    print(f"NOT FOUND: '{RAW_ASOS_PATH}' — skipping Section 5.")
 
 
 # =====================================================================
-# 2. CLEAN SHEIN
+# 6. CLEAN SHEIN
 # =====================================================================
 print("\n" + "=" * 90)
-print("SECTION 2: CLEAN SHEIN")
+print("SECTION 6: CLEAN SHEIN")
 print("=" * 90)
 
 if os.path.isfile(RAW_SHEIN_PATH):
@@ -386,14 +613,14 @@ if os.path.isfile(RAW_SHEIN_PATH):
 
     save_and_report(shein_final, 'shein')
 else:
-    print(f"NOT FOUND: '{RAW_SHEIN_PATH}' — skipping Section 2.")
+    print(f"NOT FOUND: '{RAW_SHEIN_PATH}' — skipping Section 6.")
 
 
 # =====================================================================
-# 3. CLEAN HARMONIZED H&M + UNIQLO (GB / Aus regions)
+# 7. CLEAN HARMONIZED H&M + UNIQLO (GB / Aus regions)
 # =====================================================================
 print("\n" + "=" * 90)
-print("SECTION 3: CLEAN HARMONIZED H&M + UNIQLO")
+print("SECTION 7: CLEAN HARMONIZED H&M + UNIQLO")
 print("=" * 90)
 
 if os.path.isfile(RAW_HARMONIZED_PATH):
@@ -437,14 +664,14 @@ if os.path.isfile(RAW_HARMONIZED_PATH):
     brand_summary['pct_recycled_polyester'] = (100 * brand_summary['recycled_polyester_products'] / brand_summary['products']).round(2)
     print(brand_summary.to_string(index=False))
 else:
-    print(f"NOT FOUND: '{RAW_HARMONIZED_PATH}' — skipping Section 3. (Requires openpyxl installed.)")
+    print(f"NOT FOUND: '{RAW_HARMONIZED_PATH}' — skipping Section 7. (Requires openpyxl installed.)")
 
 
 # =====================================================================
-# 4. CLEAN H&M (handm.csv, real prices, tagged region = US)
+# 8. CLEAN H&M (handm.csv, real prices, tagged region = US)
 # =====================================================================
 print("\n" + "=" * 90)
-print("SECTION 4: CLEAN H&M")
+print("SECTION 8: CLEAN H&M")
 print("=" * 90)
 
 if os.path.isfile(RAW_HM_PATH):
@@ -479,14 +706,14 @@ if os.path.isfile(RAW_HM_PATH):
     save_and_report(hm_final, 'hm')
     print(f"Products with price: {hm_final['price'].notna().sum()}")
 else:
-    print(f"NOT FOUND: '{RAW_HM_PATH}' — skipping Section 4.")
+    print(f"NOT FOUND: '{RAW_HM_PATH}' — skipping Section 8.")
 
 
 # =====================================================================
-# 5. MATERIAL COMPOSITION BY STORE — TABLES + GRAPHS
+# 9. MATERIAL COMPOSITION BY STORE — TABLES + GRAPHS
 # =====================================================================
 print("\n" + "=" * 90)
-print("SECTION 5: MATERIAL COMPOSITION BY STORE (tables + graphs)")
+print("SECTION 9: MATERIAL COMPOSITION BY STORE (tables + graphs)")
 print("=" * 90)
 
 STORE_FILES = {
@@ -518,13 +745,11 @@ for store_name, path in STORE_FILES.items():
 
 
 # =====================================================================
-# 6. ONE-WAY ANOVA — materials per product (complexity), by store
+# 10. ONE-WAY ANOVA — materials per product (complexity), by store
 # =====================================================================
 print("\n" + "=" * 90)
-print("SECTION 6: ANOVA — materials per product, by store")
+print("SECTION 10: ANOVA — materials per product, by store")
 print("=" * 90)
-
-ANOVA_STORE_FILES = {'H&M': 'hm_clean.csv', 'ASOS': 'asos_clean.csv', 'Shein': 'shein_clean.csv'}
 
 anova_frames = []
 for store_name, path in ANOVA_STORE_FILES.items():
@@ -572,13 +797,11 @@ else:
 
 
 # =====================================================================
-# 7. ONE-WAY ANOVA — % composition (polyester / recycled polyester / cotton), by store
+# 11. ONE-WAY ANOVA — % composition (polyester / recycled polyester / cotton), by store
 # =====================================================================
 print("\n" + "=" * 90)
-print("SECTION 7: ANOVA — material % composition, by store")
+print("SECTION 11: ANOVA — material % composition, by store")
 print("=" * 90)
-
-TARGETS = {'polyester': 'polyester', 'recycled polyester': 'recycled_polyester', 'cotton': 'cotton'}
 
 pct_frames = []
 for store_name, path in ANOVA_STORE_FILES.items():
@@ -626,10 +849,10 @@ else:
 
 
 # =====================================================================
-# 8. MATERIAL COMPOSITION vs PRICE
+# 12. MATERIAL COMPOSITION vs PRICE
 # =====================================================================
 print("\n" + "=" * 90)
-print("SECTION 8: MATERIAL COMPOSITION vs PRICE")
+print("SECTION 12: MATERIAL COMPOSITION vs PRICE")
 print("=" * 90)
 
 price_frames = []
@@ -675,10 +898,10 @@ else:
 
 
 # =====================================================================
-# 9. REGION BREAKDOWN PER STORE (H&M: US/GB/Aus, Uniqlo: GB/Aus, ASOS: GB, Shein: India)
+# 13. REGION BREAKDOWN PER STORE (H&M: US/GB/Aus, Uniqlo: GB/Aus, ASOS: GB, Shein: India)
 # =====================================================================
 print("\n" + "=" * 90)
-print("SECTION 9: REGION BREAKDOWN PER STORE")
+print("SECTION 13: REGION BREAKDOWN PER STORE")
 print("=" * 90)
 
 # ---- H&M ----
